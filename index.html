@@ -1,331 +1,435 @@
-%% Real-time quaternion MEKF attitude estimation from HyperIMU (UDP), live 3D view
-% Fully coupled MARG fusion per the derivation PDF:
-%   SECTION A : 30 s magnetometer calibration (live ellipsoid -> A, b -> sphere)
-%   SECTION B : STILL initialisation (~1.5 s): gyro bias b0, roll/pitch from
-%               accel, and the magnetic reference m_ref MEASURED from data
-%               (absorbs declination + device sign convention; yaw therefore
-%               reads RELATIVE to the starting pose, psi0 = 0).
-%   SECTION C : MEKF loop. Nominal state = unit quaternion (body-to-nav,
-%               Hamilton scalar-first) + gyro bias. 6x6 error covariance.
-%               Accel and mag enter as FULL 3-axis vector measurements with
-%               H = [ [h_hat]x | 0 ]. Multiplicative injection, Joseph form.
-%
-% HyperIMU datagram order:  ACCEL , MAG , GYRO  ->  ax ay az mx my mz gx gy gz
-% Stop by closing the live-attitude figure.
-%
-% OPERATIONAL REQUIREMENTS (new vs the Euler version):
-%   * Phone must be HELD STILL during the INIT window, or b0 and m_ref are
-%     silently wrong and the filter starts poisoned.
-%   * MAG_MAP / MAG_SGN must be the TRUE device axis alignment. The coupled
-%     filter consumes the mag as a vector: a wrong map now corrupts roll and
-%     pitch near disturbances, not just yaw.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arm control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  :root{
+    --bg:#0e1214;
+    --panel:#161b1e;
+    --card:#1d2327;
+    --line:#2a3136;
+    --line-soft:#1a2023;
+    --text:#e7ebed;
+    --text-dim:#8b9498;
+    --teal:#3ddcae;
+    --teal-dim:#1f7a5c;
+    --amber:#f2a33c;
+    --red:#e2584f;
+    --green:#5cc26a;
+    --blue:#4f9ce2;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:
+      linear-gradient(var(--line-soft) 1px, transparent 1px) 0 0/40px 40px,
+      linear-gradient(90deg, var(--line-soft) 1px, transparent 1px) 0 0/40px 40px,
+      var(--bg);
+    color:var(--text);
+    font-family:'IBM Plex Sans', sans-serif;
+    min-height:100vh;
+    padding:24px;
+  }
+  .app{max-width:1040px;margin:0 auto;}
+  header{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-end;
+    margin-bottom:20px;
+    flex-wrap:wrap;
+    gap:12px;
+  }
+  h1{
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:600;
+    font-size:22px;
+    margin:0;
+    letter-spacing:0.02em;
+  }
+  h1 span{color:var(--teal);}
+  .subtitle{color:var(--text-dim);font-size:13px;margin-top:4px;}
+  .status-pill{
+    display:flex;align-items:center;gap:8px;
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:20px;
+    padding:6px 14px 6px 10px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--text-dim);}
+  .dot.on{background:var(--teal);box-shadow:0 0 0 3px rgba(61,220,174,0.15);}
+  .dot.err{background:var(--red);box-shadow:0 0 0 3px rgba(226,88,79,0.15);}
+  @media (prefers-reduced-motion: no-preference){
+    .dot.on{animation:pulse 2s ease-in-out infinite;}
+  }
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
 
-%% ----------------------------- USER CONFIG -----------------------------
-clear all;
-PORT = 5555;
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:20px;
+  }
+  .panel + .panel{margin-top:16px;}
+  .panel h2{
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:500;
+    font-size:14px;
+    color:var(--text-dim);
+    text-transform:uppercase;
+    letter-spacing:0.08em;
+    margin:0 0 14px;
+  }
 
-COL_AX = 1; COL_AY = 2; COL_AZ = 3;      % accel [m/s^2]
-COL_MX = 4; COL_MY = 5; COL_MZ = 6;      % mag   [uT]
-COL_GX = 7; COL_GY = 8; COL_GZ = 9;      % gyro  [rad/s]
+  .grid{display:grid;grid-template-columns:1.1fr 1fr;gap:16px;align-items:start;}
+  @media (max-width:760px){.grid{grid-template-columns:1fr;}}
 
-GYRO_IN_DEG = false;
-SGN_AX = +1; SGN_AY = +1; SGN_AZ = +1;
-SGN_GX = +1; SGN_GY = +1; SGN_GZ = +1;
-MAG_MAP = [1 2 3];
-MAG_SGN = [-1 -1 +1];        % your device's verified axis alignment
+  label{display:block;font-size:12px;color:var(--text-dim);margin-bottom:4px;}
+  input, select{
+    width:100%;
+    background:var(--card);
+    border:1px solid var(--line);
+    color:var(--text);
+    border-radius:6px;
+    padding:9px 10px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:13px;
+  }
+  input:focus, select:focus, button:focus{
+    outline:2px solid var(--teal);
+    outline-offset:1px;
+  }
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;}
 
-% --- Magnetometer calibration ---
-CAL_DURATION = 90;  CAL_MIN_SAMPLES = 300;  CAL_REFIT_EVERY = 0.5;
+  button{
+    background:var(--card);
+    border:1px solid var(--line);
+    color:var(--text);
+    border-radius:6px;
+    padding:9px 12px;
+    font-family:'IBM Plex Sans', sans-serif;
+    font-size:13px;
+    font-weight:500;
+    cursor:pointer;
+    transition:border-color .15s, background .15s;
+  }
+  button:hover{border-color:var(--line);background:#22292d;}
+  button.primary{background:var(--teal-dim);border-color:var(--teal-dim);color:#eafff6;}
+  button.primary:hover{background:#218f6a;}
+  button.active{border-color:var(--teal);color:var(--teal);}
+  button.wide{width:100%;}
+  button.danger{border-color:var(--red);color:var(--red);}
+  button:disabled{opacity:0.4;cursor:not-allowed;}
 
-% --- Still-init window ---
-INIT_TIME = 1.5;             % seconds; HOLD THE PHONE STILL
+  .btn-group{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;}
+  .btn-group button{flex:1;}
 
-% --- MEKF noise parameters (TUNING KNOBS, not derived values) ---
-GYRO_NOISE_STD = 0.01;       % rad/s          -> Q attitude block
-BIAS_WALK_STD  = 5e-4;       % rad/s/sqrt(s)  -> Q bias block
-ACC_NOISE_STD  = 0.5;        % m/s^2 (inflated: handheld motion is model error)
-MAG_NOISE_STD  = 0.05;       % unit-field units
+  .color-btn{border-width:1px;}
+  .color-btn[data-c="RED"].active{border-color:var(--red);color:var(--red);}
+  .color-btn[data-c="GREEN"].active{border-color:var(--green);color:var(--green);}
+  .color-btn[data-c="BLUE"].active{border-color:var(--blue);color:var(--blue);}
 
-% --- Initial uncertainty ---
-P0_ATT  = deg2rad(10)^2;     % rad^2 per attitude axis
-P0_BIAS = 0.02^2;            % (rad/s)^2 per bias axis
+  .jog{
+    display:grid;
+    grid-template-columns:repeat(4, 1fr);
+    gap:10px;
+    margin-bottom:16px;
+  }
+  .jog-col{display:flex;flex-direction:column;gap:6px;align-items:center;}
+  .jog-col .label{font-size:11px;color:var(--text-dim);font-family:'IBM Plex Mono',monospace;}
+  .jog-col button{width:100%;padding:10px 0;font-size:15px;}
+  .jog-val{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:13px;
+    color:var(--teal);
+    padding:4px 0;
+  }
 
-% --- Measurement gates ---
-ACC_GATE     = 1.0;          % accept accel update if | ||a|| - g | < this [m/s^2]
-MAG_NORM_TOL = 0.25;         % accept mag  update if | ||m_cal|| - 1 | < this
+  .telemetry-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;}
+  .tcard{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:10px 12px;
+  }
+  .tcard .k{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.05em;}
+  .tcard .v{font-family:'IBM Plex Mono', monospace;font-size:18px;margin-top:2px;}
 
-GRAV = 9.81;
-DT_MIN = 1e-4;  DT_MAX = 0.10;
+  .counts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+  .ccard{
+    border-radius:8px;
+    padding:14px 10px;
+    text-align:center;
+    border:1px solid var(--line);
+    background:var(--card);
+  }
+  .ccard.RED{border-color:rgba(226,88,79,0.4);}
+  .ccard.GREEN{border-color:rgba(92,194,106,0.4);}
+  .ccard.BLUE{border-color:rgba(79,156,226,0.4);}
+  .ccard .n{font-family:'IBM Plex Mono', monospace;font-size:26px;}
+  .ccard.RED .n{color:var(--red);}
+  .ccard.GREEN .n{color:var(--green);}
+  .ccard.BLUE .n{color:var(--blue);}
+  .ccard .l{font-size:11px;color:var(--text-dim);margin-top:2px;text-transform:uppercase;letter-spacing:0.05em;}
 
-%% =================== SECTION A: MAGNETOMETER CALIBRATION ===============
-% Rotate the phone SLOWLY through ALL orientations. Coverage beats time.
-clear u
-u = udpport("datagram", "LocalPort", PORT);
-flush(u);
+  details{margin-bottom:14px;}
+  summary{cursor:pointer;font-size:12px;color:var(--text-dim);}
+  .conn-fields{margin-top:12px;}
+</style>
+</head>
+<body>
+<div class="app">
 
-figCal = figure('Name','Magnetometer calibration','NumberTitle','off', ...
-                'Position',[80 80 1150 520]);
-axRaw = subplot(1,2,1); hold(axRaw,'on'); grid(axRaw,'on'); axis(axRaw,'equal');
-view(axRaw,135,25); rotate3d(axRaw,'on');
-xlabel(axRaw,'m_x [\muT]'); ylabel(axRaw,'m_y [\muT]'); zlabel(axRaw,'m_z [\muT]');
-hPts = plot3(axRaw,nan,nan,nan,'.','MarkerSize',4,'Color',[0.25 0.45 0.85]);
-hEll = surf(axRaw,nan(2),nan(2),nan(2),'FaceColor',[0.9 0.4 0.2], ...
-            'FaceAlpha',0.25,'EdgeColor','none');
-tRaw = title(axRaw,'collecting...');
+  <header>
+    <div>
+      <h1>Robotic arm <span>control</span></h1>
+      <div class="subtitle">Manual jog · coordinate targeting · color pick counts</div>
+    </div>
+    <div class="status-pill">
+      <span class="dot" id="connDot"></span>
+      <span id="connLabel">Disconnected</span>
+    </div>
+  </header>
 
-axCal = subplot(1,2,2); hold(axCal,'on'); grid(axCal,'on'); axis(axCal,'equal');
-view(axCal,135,25); rotate3d(axCal,'on');
-title(axCal,'calibrated (after fit)');
-[sx,sy,sz] = sphere(24);
-surf(axCal,sx,sy,sz,'FaceColor','none','EdgeColor',[0.7 0.7 0.7]);
+  <div class="panel">
+    <details id="connDetails" open>
+      <summary>Broker connection</summary>
+      <div class="conn-fields">
+        <div class="row">
+          <div>
+            <label for="host">Broker host</label>
+            <input id="host" placeholder="xxxxx.s1.eu.hivemq.cloud">
+          </div>
+          <div>
+            <label for="port">Port</label>
+            <input id="port" value="8884">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="user">Username</label>
+            <input id="user" placeholder="arm-webapp">
+          </div>
+          <div>
+            <label for="pass">Password</label>
+            <input id="pass" type="password">
+          </div>
+        </div>
+        <button class="primary wide" id="connectBtn">Connect</button>
+      </div>
+    </details>
+  </div>
 
-magBuf = zeros(0,3);  tCal = tic;  tLastFit = -inf;
-bHat = []; Mt = [];
-while toc(tCal) < CAL_DURATION && ishandle(figCal)
-    while u.NumDatagramsAvailable > 0
-        dg = read(u,1,"string");
-        vals = str2double(split(string(dg.Data), ","));
-        if numel(vals) < COL_MZ || any(isnan(vals(COL_MX:COL_MZ))), continue, end
-        mraw  = vals([COL_MX COL_MY COL_MZ]);
-        mbody = MAG_SGN(:) .* mraw(MAG_MAP);
-        magBuf(end+1,:) = mbody.'; %#ok<SAGROW>
-    end
-    if size(magBuf,1) >= 100 && toc(tCal)-tLastFit > CAL_REFIT_EVERY
-        tLastFit = toc(tCal);
-        [bTry,MtTry,ok] = ellipsoidFitLocal(magBuf);
-        if ok
-            bHat = bTry;  Mt = MtTry;
-            [Xe,Ye,Ze] = ellipsoidSurfLocal(bHat,Mt,sx,sy,sz);
-            set(hEll,'XData',Xe,'YData',Ye,'ZData',Ze);
-        end
-    end
-    set(hPts,'XData',magBuf(:,1),'YData',magBuf(:,2),'ZData',magBuf(:,3));
-    set(tRaw,'String',sprintf('raw + ellipsoid | N = %d | %4.1f s left', ...
-        size(magBuf,1), max(0,CAL_DURATION-toc(tCal))));
-    drawnow limitrate
-end
-assert(size(magBuf,1) >= CAL_MIN_SAMPLES, 'Too few samples (%d).', size(magBuf,1));
-[bHat,Mt,ok] = ellipsoidFitLocal(magBuf);
-assert(ok, 'Data do not define an ellipsoid: redo with full slow rotations.');
+  <div class="grid">
 
-[Vm,Lm] = eig((Mt+Mt.')/2);  lam = diag(Lm);
-A_cal = Vm*diag(1./sqrt(lam))*Vm.';
-A_inv = Vm*diag(   sqrt(lam))*Vm.';
-fprintf('\n========== MAG CALIBRATION ==========\n');
-fprintf('b [uT] : [% .3f % .3f % .3f]\n', bHat);
-fprintf('A (H=1):\n'); disp(A_cal);
+    <!-- LEFT: CONTROLS -->
+    <div>
+      <div class="panel">
+        <h2>Mode</h2>
+        <div class="btn-group" id="modeGroup">
+          <button data-mode="STOP" class="danger">Stop</button>
+          <button data-mode="MANUAL">Manual</button>
+          <button data-mode="AUTO">Autonomous</button>
+        </div>
 
-mc = (A_inv*(magBuf - bHat.').').';
-plot3(axCal,mc(:,1),mc(:,2),mc(:,3),'.','MarkerSize',4,'Color',[0.20 0.60 0.30]);
-nrm = vecnorm(mc,2,2);
-title(axCal,sprintf('calibrated: ||m|| = %.3f \\pm %.3f',mean(nrm),std(nrm)));
-drawnow
+        <h2>Target color</h2>
+        <div class="btn-group" id="colorGroup">
+          <button class="color-btn" data-c="RED">Red</button>
+          <button class="color-btn" data-c="GREEN">Green</button>
+          <button class="color-btn" data-c="BLUE">Blue</button>
+        </div>
+      </div>
 
-%% ============== SECTION B: STILL INITIALISATION (~1.5 s) ================
-fprintf('\nHOLD THE PHONE STILL for %.1f s (measuring gyro bias + m_ref)...\n', INIT_TIME);
-flush(u);
-accA = zeros(0,3); magA = zeros(0,3); gyrA = zeros(0,3);
-tInit = tic;
-needCols = [COL_AX COL_AY COL_AZ COL_MX COL_MY COL_MZ COL_GX COL_GY COL_GZ];
-while toc(tInit) < INIT_TIME
-    while u.NumDatagramsAvailable > 0
-        dg = read(u,1,"string");
-        vals = str2double(split(string(dg.Data), ","));
-        if numel(vals) < max(needCols) || any(isnan(vals(needCols))), continue, end
-        a = [SGN_AX*vals(COL_AX); SGN_AY*vals(COL_AY); SGN_AZ*vals(COL_AZ)];
-        w = [SGN_GX*vals(COL_GX); SGN_GY*vals(COL_GY); SGN_GZ*vals(COL_GZ)];
-        if GYRO_IN_DEG, w = w*pi/180; end
-        mraw  = vals([COL_MX COL_MY COL_MZ]);
-        mbody = MAG_SGN(:) .* mraw(MAG_MAP);
-        accA(end+1,:) = a.';  gyrA(end+1,:) = w.'; %#ok<SAGROW>
-        magA(end+1,:) = (A_inv*(mbody - bHat)).'; %#ok<SAGROW>
-    end
-    pause(0.005);
-end
-assert(size(accA,1) >= 20, 'Init window received too few packets.');
-% stillness sanity check: gyro should be near zero
-assert(norm(mean(gyrA,1)) < 0.15, ...
-    'Init FAILED: phone was moving (mean |gyro| = %.3f rad/s). Rerun and hold still.', ...
-    norm(mean(gyrA,1)));
+      <div class="panel">
+        <h2>Manual jog</h2>
+        <div class="jog">
+          <div class="jog-col">
+            <span class="label">Base</span>
+            <button data-j="base" data-d="1">&larr;</button>
+            <span class="jog-val" id="valBase">90</span>
+            <button data-j="base" data-d="-1">&rarr;</button>
+          </div>
+          <div class="jog-col">
+            <span class="label">Shoulder</span>
+            <button data-j="shoulder" data-d="1">&uarr;</button>
+            <span class="jog-val" id="valShoulder">68</span>
+            <button data-j="shoulder" data-d="-1">&darr;</button>
+          </div>
+          <div class="jog-col">
+            <span class="label">Elbow</span>
+            <button data-j="elbow" data-d="1">&uarr;</button>
+            <span class="jog-val" id="valElbow">160</span>
+            <button data-j="elbow" data-d="-1">&darr;</button>
+          </div>
+          <div class="jog-col">
+            <span class="label">Gripper</span>
+            <button data-j="gripper" data-d="1">Open</button>
+            <span class="jog-val" id="valGripper">0</span>
+            <button data-j="gripper" data-d="-1">Close</button>
+          </div>
+        </div>
 
-aAvg = mean(accA,1).';   mAvg = mean(magA,1).';   bhat = mean(gyrA,1).';
-phi0   = atan2( aAvg(2), sqrt(aAvg(1)^2 + aAvg(3)^2));
-theta0 = atan2(-aAvg(1), sqrt(aAvg(2)^2 + aAvg(3)^2));
-qhat   = eul2quatLocal(phi0, theta0, 0);              % psi0 = 0: heading is RELATIVE
-m_ref  = Rquat(qhat) * (mAvg / norm(mAvg));           % measured reference (unit)
-% For ABSOLUTE heading instead: set psi0 from your tilt-compensated formula
-% here (one-time), THEN compute m_ref the same way.
+        <h2>Send coordinates</h2>
+        <div class="row">
+          <div>
+            <label for="coordX">Wrist X (cm)</label>
+            <input id="coordX" value="10">
+          </div>
+          <div>
+            <label for="coordY">Wrist Y (cm)</label>
+            <input id="coordY" value="-0.9">
+          </div>
+        </div>
+        <button class="primary wide" id="sendCoords">Send to arm</button>
+      </div>
+    </div>
 
-P = blkdiag(P0_ATT*eye(3), P0_BIAS*eye(3));           % 6x6 error covariance
-Ra = ACC_NOISE_STD^2 * eye(3);
-Rm = MAG_NOISE_STD^2 * eye(3);
-fprintf('init: roll %.1f deg, pitch %.1f deg, |b0| = %.4f rad/s, m_ref = [% .3f % .3f % .3f]\n', ...
-    rad2deg(phi0), rad2deg(theta0), norm(bhat), m_ref);
+    <!-- RIGHT: TELEMETRY -->
+    <div>
+      <div class="panel">
+        <h2>Live status</h2>
+        <div class="telemetry-grid">
+          <div class="tcard"><div class="k">Mode</div><div class="v" id="tMode">&mdash;</div></div>
+          <div class="tcard"><div class="k">Phase</div><div class="v" id="tPhase">&mdash;</div></div>
+          <div class="tcard"><div class="k">Base</div><div class="v" id="tBase">&mdash;</div></div>
+          <div class="tcard"><div class="k">Shoulder</div><div class="v" id="tShoulder">&mdash;</div></div>
+          <div class="tcard"><div class="k">Elbow</div><div class="v" id="tElbow">&mdash;</div></div>
+          <div class="tcard"><div class="k">Gripper</div><div class="v" id="tGripper">&mdash;</div></div>
+          <div class="tcard"><div class="k">Distance</div><div class="v" id="tDist">&mdash;</div></div>
+          <div class="tcard"><div class="k">Last update</div><div class="v" id="tTime" style="font-size:13px;">&mdash;</div></div>
+        </div>
+      </div>
 
-%% ------------------------------ 3D FIGURE ------------------------------
-fig = figure('Name','Live Attitude (MEKF, quaternion)','NumberTitle','off');
-ax3 = axes('Parent',fig); hold(ax3,'on');
-view(ax3,135,25); axis(ax3,'equal'); grid(ax3,'on'); rotate3d(ax3,'on');
-xlim(ax3,[-1.2 1.2]); ylim(ax3,[-1.2 1.2]); zlim(ax3,[-1.2 1.2]);
-xlabel(ax3,'X'); ylabel(ax3,'Y'); zlabel(ax3,'Z');
+      <div class="panel">
+        <h2>Pick counts</h2>
+        <div class="counts">
+          <div class="ccard RED"><div class="n" id="cRED">0</div><div class="l">Red</div></div>
+          <div class="ccard GREEN"><div class="n" id="cGREEN">0</div><div class="l">Green</div></div>
+          <div class="ccard BLUE"><div class="n" id="cBLUE">0</div><div class="l">Blue</div></div>
+        </div>
+      </div>
+    </div>
 
-hx = 0.35; hy = 0.70; hz = 0.05;
-V = [-hx -hy -hz; hx -hy -hz; hx hy -hz; -hx hy -hz; ...
-     -hx -hy  hz; hx -hy  hz; hx hy  hz; -hx hy  hz];
-Fc = [1 2 3 4; 5 6 7 8; 1 2 6 5; 2 3 7 6; 3 4 8 7; 4 1 5 8];
-tf = hgtransform('Parent',ax3);
-patch('Parent',tf,'Vertices',V,'Faces',Fc, ...
-      'FaceColor',[0.20 0.50 0.90],'FaceAlpha',0.92,'EdgeColor','k');
-patch('Parent',tf,'Vertices',V,'Faces',[5 6 7 8], ...
-      'FaceColor',[0.95 0.85 0.20],'EdgeColor','k');
-quiver3(ax3,0,0,0,1,0,0,'r','LineWidth',1.5,'MaxHeadSize',0.5);
-quiver3(ax3,0,0,0,0,1,0,'g','LineWidth',1.5,'MaxHeadSize',0.5);
-quiver3(ax3,0,0,0,0,0,1,'b','LineWidth',1.5,'MaxHeadSize',0.5);
-ttl = title(ax3,'waiting for packets');
+  </div>
+</div>
 
-% ============== SECTION C: MEKF LIVE LOOP ==============================
-tStart = tic;  tPrev = [];
-flush(u);
-while ishandle(fig)
-    got = false;
-    while u.NumDatagramsAvailable > 0
-        tNow = toc(tStart);
-        dg = read(u,1,"string");
-        vals = str2double(split(string(dg.Data), ","));
-        if numel(vals) < max(needCols) || any(isnan(vals(needCols))), continue, end
+<script>
+let client = null;
+let armState = { base: 90, shoulder: 68, elbow: 160, gripper: 0 };
+const STEP = 2;
 
-        a = [SGN_AX*vals(COL_AX); SGN_AY*vals(COL_AY); SGN_AZ*vals(COL_AZ)];
-        w = [SGN_GX*vals(COL_GX); SGN_GY*vals(COL_GY); SGN_GZ*vals(COL_GZ)];
-        if GYRO_IN_DEG, w = w*pi/180; end
-        mraw  = vals([COL_MX COL_MY COL_MZ]);
-        m_cal = A_inv*(MAG_SGN(:).*mraw(MAG_MAP) - bHat);
+const connDot = document.getElementById('connDot');
+const connLabel = document.getElementById('connLabel');
 
-        if isempty(tPrev), tPrev = tNow; continue, end
-        dt = min(max(tNow - tPrev, DT_MIN), DT_MAX);  tPrev = tNow;
+function setConnState(state){
+  connDot.className = 'dot' + (state === 'on' ? ' on' : state === 'err' ? ' err' : '');
+  connLabel.textContent = state === 'on' ? 'Connected' : state === 'err' ? 'Connection error' : 'Disconnected';
+}
 
-        % ---------------- PREDICT ----------------
-        w_hat = w - bhat;
-        qhat  = qmulLocal(qhat, qincLocal(w_hat, dt));   % exact increment (norm-exact)
-        qhat  = qhat / norm(qhat);                       % vs floating-point drift
-        Fk = [eye(3)-skewLocal(w_hat)*dt, -eye(3)*dt;
-              zeros(3),                    eye(3)];
-        Qk = blkdiag(GYRO_NOISE_STD^2*dt*eye(3), BIAS_WALK_STD^2*dt*eye(3));
-        P  = Fk*P*Fk.' + Qk;
+document.getElementById('connectBtn').addEventListener('click', () => {
+  if (client) { client.end(true); client = null; }
 
-        % ---------------- ACCEL UPDATE (gated) ----------------
-        if abs(norm(a) - GRAV) < ACC_GATE
-            [qhat,bhat,P] = mekfUpdateLocal(qhat,bhat,P, a, [0;0;GRAV], Ra);
-        end
-        % ---------------- MAG UPDATE (gated) ----------------
-        if abs(norm(m_cal) - 1) < MAG_NORM_TOL
-            [qhat,bhat,P] = mekfUpdateLocal(qhat,bhat,P, m_cal/norm(m_cal), m_ref, Rm);
-        end
-        got = true;
-    end
+  const host = document.getElementById('host').value.trim();
+  const port = document.getElementById('port').value.trim() || '8884';
+  const user = document.getElementById('user').value.trim();
+  const pass = document.getElementById('pass').value;
 
-    if got
-        Rbn = Rquat(qhat);                    % body-to-nav = world-from-body
-        M = eye(4);  M(1:3,1:3) = Rbn;
-        set(tf,'Matrix',M);
-        [phi,theta,psi] = quat2eulLocal(qhat);
-        set(ttl,'String',sprintf( ...
-            'roll = %+6.1f\\circ  pitch = %+6.1f\\circ  yaw(rel) = %+6.1f\\circ  |b| = %.3f', ...
-            rad2deg(phi), rad2deg(theta), rad2deg(psi), norm(bhat)));
-        drawnow limitrate
-    else
-        pause(0.005);
-    end
-end
-clear u
-disp("Stopped.");
+  if (!host || !user) { alert('Enter broker host and username first.'); return; }
 
-%% ---------------------------- LOCAL FUNCTIONS ---------------------------
-function [q,b,P] = mekfUpdateLocal(q,b,P, z, ref, R)
-% One full-vector MEKF update: h = R(q)' ref, H = [ [h]x | 0 ], Joseph form,
-% multiplicative injection, implicit reset (error mean -> 0).
-    h = Rquat(q).' * ref;
-    H = [skewLocal(h), zeros(3)];
-    S = H*P*H.' + R;
-    K = (P*H.')/S;
-    dx = K*(z - h);
-    IKH = eye(6) - K*H;
-    P = IKH*P*IKH.' + K*R*K.';               % Joseph form
-    q = qmulLocal(q, qincLocal(dx(1:3), 1)); % exact exp-map injection
-    q = q / norm(q);
-    b = b + dx(4:6);
-end
+  const url = `wss://${host}:${port}/mqtt`;
+  client = mqtt.connect(url, {
+    username: user,
+    password: pass,
+    clientId: 'webapp_' + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000,
+  });
 
-function q = qmulLocal(a,b)
-% Hamilton product, scalar-first.
-    q = [a(1)*b(1) - a(2:4).'*b(2:4);
-         a(1)*b(2:4) + b(1)*a(2:4) + cross(a(2:4), b(2:4))];
-end
+  client.on('connect', () => {
+    setConnState('on');
+    client.subscribe('arm/status', { qos: 0 });
+    client.subscribe('arm/counts', { qos: 0 });
+    document.getElementById('connDetails').open = false;
+  });
+  client.on('reconnect', () => setConnState('off'));
+  client.on('close', () => setConnState('off'));
+  client.on('error', () => setConnState('err'));
 
-function dq = qincLocal(v, dt)
-% Unit quaternion for rotation v*dt (exp map). Safe at ||v||->0.
-    ang = norm(v)*dt;
-    if ang < 1e-12
-        dq = [1;0;0;0];
-    else
-        dq = [cos(ang/2); sin(ang/2)*(v/norm(v))];
-    end
-end
+  client.on('message', (topic, payload) => {
+    try {
+      const data = JSON.parse(payload.toString());
+      if (topic === 'arm/status') updateStatus(data);
+      if (topic === 'arm/counts') updateCounts(data);
+    } catch (e) { /* ignore malformed payloads */ }
+  });
+});
 
-function R = Rquat(q)
-% Body-to-nav rotation matrix, Hamilton scalar-first (v^n = R q v^b).
-    q0=q(1); q1=q(2); q2=q(3); q3=q(4);
-    R = [1-2*(q2^2+q3^2),  2*(q1*q2-q0*q3),  2*(q1*q3+q0*q2);
-         2*(q1*q2+q0*q3),  1-2*(q1^2+q3^2),  2*(q2*q3-q0*q1);
-         2*(q1*q3-q0*q2),  2*(q2*q3+q0*q1),  1-2*(q1^2+q2^2)];
-end
+function publish(topic, payload, qos = 1) {
+  if (!client || !client.connected) { alert('Not connected to broker.'); return; }
+  const msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  client.publish(topic, msg, { qos, retain: false });
+}
 
-function S = skewLocal(v)
-    S = [0 -v(3) v(2); v(3) 0 -v(1); -v(2) v(1) 0];
-end
+// Mode buttons
+document.getElementById('modeGroup').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  document.querySelectorAll('#modeGroup button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  publish('arm/cmd/mode', btn.dataset.mode);
+});
 
-function q = eul2quatLocal(phi, theta, psi)
-% q = qz(psi) (x) qy(theta) (x) qx(phi), matching R(q)' = Rx Ry Rz (lab).
-    qx = [cos(phi/2);   sin(phi/2); 0; 0];
-    qy = [cos(theta/2); 0; sin(theta/2); 0];
-    qz = [cos(psi/2);   0; 0; sin(psi/2)];
-    q = qmulLocal(qz, qmulLocal(qy, qx));
-    q = q / norm(q);
-end
+// Color buttons
+document.getElementById('colorGroup').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-c]');
+  if (!btn) return;
+  document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  publish('arm/cmd/color', btn.dataset.c);
+});
 
-function [phi,theta,psi] = quat2eulLocal(q)
-% Extraction matching the lab Euler convention (verified to 1e-15).
-    q0=q(1); q1=q(2); q2=q(3); q3=q(4);
-    phi   = atan2(2*(q0*q1+q2*q3), 1-2*(q1^2+q2^2));
-    theta = asin(max(-1,min(1, 2*(q0*q2-q1*q3))));   % clip vs fp overshoot
-    psi   = atan2(2*(q1*q2+q0*q3), 1-2*(q2^2+q3^2));
-end
+// Jog buttons
+document.querySelectorAll('button[data-j]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const joint = btn.dataset.j;
+    const dir = parseInt(btn.dataset.d, 10);
+    armState[joint] = Math.min(180, Math.max(0, armState[joint] + dir * STEP));
+    document.getElementById('val' + joint.charAt(0).toUpperCase() + joint.slice(1)).textContent = armState[joint];
+    publish('arm/cmd/manual', armState);
+  });
+});
 
-function [b, Mt, ok] = ellipsoidFitLocal(Mdat)
-% SVD ellipsoid fit per the calibration derivation; pre-conditioned.
-    mu = mean(Mdat,1);
-    sc = mean(vecnorm(Mdat - mu, 2, 2));
-    n  = (Mdat - mu)/sc;
-    xs=n(:,1); ys=n(:,2); zs=n(:,3);
-    D = [xs.^2 ys.^2 zs.^2 2*xs.*ys 2*xs.*zs 2*ys.*zs 2*xs 2*ys 2*zs ones(size(xs))];
-    [~,~,Vd] = svd(D,'econ');  th = Vd(:,end);
-    Qm = [th(1) th(4) th(5); th(4) th(2) th(6); th(5) th(6) th(3)];
-    uv = th(7:9);  s = th(10);
-    ev = eig((Qm+Qm.')/2);
-    if all(ev<0), Qm=-Qm; uv=-uv; s=-s; ev=-ev; end
-    ok = all(ev>0);
-    if ~ok, b=zeros(3,1); Mt=eye(3); return, end
-    bn = -(Qm\uv);
-    Mn = Qm/(uv.'*(Qm\uv) - s);
-    ok = all(eig((Mn+Mn.')/2) > 0);
-    b  = mu.' + sc*bn;
-    Mt = Mn/sc^2;
-end
+// Coordinates
+document.getElementById('sendCoords').addEventListener('click', () => {
+  const x = parseFloat(document.getElementById('coordX').value);
+  const y = parseFloat(document.getElementById('coordY').value);
+  if (Number.isNaN(x) || Number.isNaN(y)) { alert('Enter valid X and Y values.'); return; }
+  publish('arm/cmd/coords', { x, y });
+});
 
-function [Xe,Ye,Ze] = ellipsoidSurfLocal(b, Mt, sx, sy, sz)
-    [Vm,Lm] = eig((Mt+Mt.')/2);
-    T = Vm*diag(1./sqrt(diag(Lm)));
-    Pts = T*[sx(:) sy(:) sz(:)].' + b;
-    Xe = reshape(Pts(1,:),size(sx));
-    Ye = reshape(Pts(2,:),size(sy));
-    Ze = reshape(Pts(3,:),size(sz));
-end
+// Telemetry rendering
+function updateStatus(d) {
+  if ('mode' in d) document.getElementById('tMode').textContent = d.mode;
+  if ('phase' in d) document.getElementById('tPhase').textContent = d.phase;
+  if ('base' in d) document.getElementById('tBase').textContent = d.base + '°';
+  if ('shoulder' in d) document.getElementById('tShoulder').textContent = d.shoulder + '°';
+  if ('elbow' in d) document.getElementById('tElbow').textContent = d.elbow + '°';
+  if ('gripper' in d) document.getElementById('tGripper').textContent = d.gripper + '°';
+  if ('distance' in d) document.getElementById('tDist').textContent = d.distance + ' cm';
+  document.getElementById('tTime').textContent = new Date().toLocaleTimeString();
+}
+
+function updateCounts(d) {
+  ['RED','GREEN','BLUE'].forEach(c => {
+    if (c in d) document.getElementById('c' + c).textContent = d[c];
+  });
+}
+</script>
+</body>
+</html>
